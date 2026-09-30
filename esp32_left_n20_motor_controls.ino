@@ -1,0 +1,389 @@
+//Code for the Left ESP 32. Responsible for all n20 motor controls.
+
+#include <Arduino.h>
+#include <Adafruit_NeoPixel.h>
+
+// Function declarations
+void doHeartbeat();
+void setMotor(int dir, int pwm, int in1, int in2);
+void ARDUINO_ISR_ATTR buttonISR(void* arg);
+void ARDUINO_ISR_ATTR encoderISR(void* arg);
+
+// Button structure
+struct Button {
+  const int pin;                                                       // GPIO pin for button
+  volatile uint32_t numberPresses;                                     // counter for number of button presses
+  uint32_t nextPressTime;                                              // time of next allowable press in milliseconds
+  volatile bool pressed;                                               // flag for button press event
+};
+
+// Encoder structure
+struct Encoder {
+  const int PinA;                                                      // GPIO pin for encoder Channel A
+  const int PinB;                                                      // GPIO pin for encoder Channel B
+  volatile long pos;                                                   // current encoder position
+};
+
+// Function declarations
+void doHeartbeat();
+void setMotor(int dir, int pwm, int in1, int in2);
+void ARDUINO_ISR_ATTR buttonISR(void* arg);
+void ARDUINO_ISR_ATTR encoderISR(void* arg);
+
+// Constants
+const int cHeartbeatInterval = 75;                                     // heartbeat update interval, in milliseconds
+const int cSmartLED          = 23;                                     // when DIP switch S1-4 is on, SMART LED is connected to GPIO23
+const int cSmartLEDCount     = 1;                                      // number of Smart LEDs in use
+const long cDebounceDelay    = 170;                                    // switch debounce delay in milliseconds
+const int cNumMotors         = 4;                                      // Number of DC motors
+const int cIN1Pin[]          = {26, 16,25, 5};                               // GPIO pin(s) for IN1 for left and right motors (A, B)
+const int cIN2Pin[]          = {27, 17,33,18};                               // GPIO pin(s) for IN2 for left and right motors (A, B)
+const int cPWMRes            = 8;                                      // bit resolution for PWM
+const int cMinPWM            = 150;                                    // PWM value for minimum speed that turns motor
+const int cMaxPWM            = pow(2, cPWMRes) - 1;                    // PWM value for maximum speed
+const int cPWMFreq           = 20000;                                  // frequency of PWM signal
+const int cCountsRev         = 1096;                                   // encoder pulses per motor revolution
+const int cPotPin            = 36;                                     // GPIO pin for drive speed potentiometer (A0)
+const int cMotorEnablePin    = 39;                                     // GPIO pin for motor enable switch (DIP S1-1)
+const int speed = 230;
+int motionState = 0;                                                   // state variable for the motion finite-state machine
+int motionState2 = 0;
+
+//=====================================================================================================================
+//
+// IMPORTANT: The constants in this section need to be set to appropriate values for your robot. 
+//            You will have to experiment to determine appropriate values.
+const int cMotorAdjustment[] = {0, 0};                                 // PWM adjustment for motors to run closer to the same speed
+
+// Variables
+boolean motorsEnabled        = true;                                   // motors enabled flag
+boolean timeUp3sec           = false;                                  // 3 second timer elapsed flag
+boolean timeUp2secBigWheel           = false;                                  // 2 second timer elapsed flag
+boolean timeUp25cm           = false;                                  // "move ~25cm" timer elapsed flag
+uint32_t lastHeartbeat       = 0;                                      // time of last heartbeat state change
+uint32_t curMillis           = 0;                                      // current time, in milliseconds
+uint32_t timerCount3sec      = 0;                                      // 3 second timer count in milliseconds
+uint32_t timerCount2secBigWheel      = 0;                                      // 2 second timer count in milliseconds
+uint32_t timerCount25cm      = 0;                                      // timer count used to approximate 25cm movement
+uint32_t robotModeIndex      = 0;                                      // robot operational state                              
+uint32_t lastTime            = 0;                                      // last time of motor control was updated
+uint32_t timerCount110sec = 0;
+uint32_t timerCount10sec = 0;
+boolean timeUp10sec = false;
+boolean timeUp110sec = false;
+Button modeButton            = {0, 0, 0, false};                       // NO pushbutton PB1 on GPIO 0, low state when pressed
+/*
+Encoder encoder[]            = {{35, 32, 0},                           // left encoder (A) on GPIO 35 and 32, 0 position 
+                                {33, 25, 0}};                          // right encoder (B) on GPIO 33 and 25, 0 position
+*/
+uint8_t driveSpeed           = 0;                                      // motor drive speed (0-255)
+uint8_t driveIndex           = 0;                                      // state index for run mode
+
+// Declare SK6812 SMART LED object
+//   Argument 1 = Number of LEDs (pixels) in use
+//   Argument 2 = ESP32 pin number 
+//   Argument 3 = Pixel type flags, add together as needed:
+//     NEO_KHZ800  800 KHz bitstream (most NeoPixel products w/WS2812 LEDs)
+//     NEO_KHZ400  400 KHz (classic 'v1' (not v2) FLORA pixels, WS2811 drivers)
+//     NEO_GRB     Pixels are wired for GRB bitstream (most NeoPixel products)
+//     NEO_RGB     Pixels are wired for RGB bitstream (v1 FLORA pixels, not v2)
+//     NEO_RGBW    Pixels are wired for RGBW bitstream (NeoPixel RGBW products)
+Adafruit_NeoPixel SmartLEDs(cSmartLEDCount, cSmartLED, NEO_RGB + NEO_KHZ800);
+
+// Smart LED brightness for heartbeat
+unsigned char LEDBrightnessIndex = 0; 
+unsigned char LEDBrightnessLevels[] = {0, 0, 0, 5, 15, 30, 45, 60, 75, 90, 105, 120, 135, 
+                                       150, 135, 120, 105, 90, 75, 60, 45, 30, 15, 5, 0};
+
+uint32_t modeIndicator[6]    = {                                       // colours for different modes
+  SmartLEDs.Color(255, 0, 0),                                          //   red - stop
+  SmartLEDs.Color(0, 255, 0),                                          //   green - run
+  SmartLEDs.Color(0, 0, 255),                                          //   blue - empty case
+  SmartLEDs.Color(255, 255, 0),                                        //   yellow - empty case
+  SmartLEDs.Color(0, 255, 255),                                        //   cyan - empty case
+  SmartLEDs.Color(255, 0, 255)                                         //   magenta - empty case
+};                                                                            
+
+void setup() {
+  Serial.begin(115200);                                                // Standard baud rate for ESP32 serial monitor
+
+  // Set up SmartLED
+  SmartLEDs.begin();                                                   // initialize smart LEDs object
+  SmartLEDs.clear();                                                   // clear pixel
+  SmartLEDs.setPixelColor(0, SmartLEDs.Color(0,0,0));                  // set pixel colours to black (off)
+  SmartLEDs.setBrightness(0);                                          // set brightness [0-255]
+  SmartLEDs.show();                                                    // update LED
+
+
+  // setup motors with encoders
+  for (int k = 0; k < cNumMotors; k++) {
+    ledcAttach(cIN1Pin[k], cPWMFreq, cPWMRes);                         // setup INT1 GPIO PWM Channel
+    ledcAttach(cIN2Pin[k], cPWMFreq, cPWMRes);                         // setup INT2 GPIO PWM Channel
+    /*
+    pinMode(encoder[k].PinA, INPUT);                                   // configure GPIO for encoder Channel A input
+    pinMode(encoder[k].PinB, INPUT);                                   // configure GPIO for encoder Channel B input
+    // configure encoder to trigger interrupt with each rising edge on Channel A
+    attachInterruptArg(encoder[k].PinA, encoderISR, &encoder[k], RISING);
+    */
+  }
+
+  // Set up push button
+  pinMode(modeButton.pin, INPUT_PULLUP);                               // configure GPIO for mode button pin with internal pullup resistor
+  attachInterruptArg(modeButton.pin, buttonISR, &modeButton, FALLING); // Configure ISR to trigger on low signal on pin
+  
+  pinMode(cPotPin, INPUT);                                             // set up drive speed potentiometer
+  pinMode(cMotorEnablePin, INPUT);                                     // set up motor enable switch (uses external pullup)
+}
+
+void loop() {
+  long pos[] = {0, 0};                                                 // current motor positions (snapshotted from ISR)
+  int pot = 0;                                                         // raw ADC value from pot
+
+  // store encoder position to avoid conflicts with ISR updates
+  noInterrupts();                                                      // disable interrupts temporarily while reading
+  /*
+  for (int k = 0; k < cNumMotors; k++) {
+      pos[k] = encoder[k].pos;                                         // read and store current motor position
+  }
+  */
+  interrupts();                                                        // turn interrupts back on
+ 
+  uint32_t curTime = micros();                                         // capture current time in microseconds
+  if (curTime - lastTime > 1000) {                                     // run this "control tick" about every 1 ms
+    lastTime = curTime;                                                // update start time for next control cycle
+
+    // 3 second timer, counts 3000 milliseconds
+    timerCount3sec += 1;                                               // increment 3 second timer count by 1 ms
+    if (timerCount3sec > 3000) {                                       // check if 3000 ms have elapsed
+      timerCount3sec = 0;                                              // reset 3 second timer count
+      timeUp3sec = true;                                               // raise 3-second elapsed flag
+    }  
+   
+    // 2 second timer, counts 2000 milliseconds
+    timerCount2secBigWheel += 1;                                               // increment 2 second timer count by 1 ms
+    if (timerCount2secBigWheel > 2000) {                                       // check if 2000 ms have elapsed
+      timerCount2secBigWheel = 0;                                              // reset 2 second timer count
+      timeUp2secBigWheel = true;                                               // raise 2-second elapsed flag
+    }
+
+    timerCount25cm += 1;                                               // increment the "distance approximation" timer by 1 ms
+    if (timerCount25cm > 7000) {                                       // after ~7000 ms, assume we've moved ~25 cm
+      timerCount25cm = 0;                                              // reset the 25 cm timer
+      timeUp25cm = true;                                               // raise the "moved 25 cm" flag
+    }
+
+    timerCount10sec += 1;
+    if (timerCount10sec > 20000) {
+      timerCount10sec = 0;
+      timeUp10sec = true;
+    }
+
+    timerCount110sec += 1;
+    if (timerCount110sec > 40000) {
+      timerCount110sec = 0;
+      timeUp110sec = true;
+    }
+
+    if (modeButton.pressed) {                                          // Change mode on button press
+      robotModeIndex++;                                                // move to next mode index
+      robotModeIndex = robotModeIndex & 7;                             // keep mode index within 0..7
+      timerCount3sec = 0;                                              // reset 3 second timer count
+      timeUp3sec = false;                                              // clear 3 second elapsed flag
+      timeUp25cm = false;                                              // clear 25cm flag on mode change
+      timerCount25cm = 0;                                              // reset 25cm timer on mode change
+      modeButton.pressed = false;                                      // consume the button press event
+    }
+
+    // check if drive motors should be powered
+    motorsEnabled = !digitalRead(cMotorEnablePin);                     // read enable switch (active-low): true when switch is on
+    
+    // modes 
+    // 0 = Default after power up/reset.           Robot is stopped
+    // 1 = Press mode button once to enter.        Run robot
+    // 2 = Press mode button twice to enter.       Add your code to do something 
+    // 3 = Press mode button three times to enter. Add your code to do something 
+    // 4 = Press mode button four times to enter.  Add your code to do something 
+    // 5 = Press mode button five times to enter.  Add your code to do something 
+    // 6 = Press mode button six times to enter.   Add your code to do something 
+    switch (robotModeIndex) {
+
+      case 0://Robot stopped. Press button to move to next case.
+        setMotor(0, 0, cIN1Pin[0], cIN2Pin[0]);                        // stop left motor
+        setMotor(0, 0, cIN1Pin[1], cIN2Pin[1]);                        // stop right motor
+        setMotor(0, 0, cIN1Pin[2], cIN2Pin[2]);                        // stop left motor
+        setMotor(0, 0, cIN1Pin[3], cIN2Pin[3]);                        // stop right motor
+        driveIndex = 0;                                                 // reset drive index
+        timerCount2secBigWheel = 0;                                            // reset 2 second timer count
+        timeUp2secBigWheel = false;                                            // reset 2 second timer
+        break;
+
+      case 1://Runs big wheel + belt motor.
+        if (motorsEnabled) {                                           // only run motion logic if motor enable switch is on
+                                                                       // and run only if enabled
+          // Read pot to update drive motor speed
+          pot = analogRead(cPotPin);                                   // read analog potentiometer (0..4095)
+          driveSpeed = map(pot, 0, 4095, cMinPWM, cMaxPWM);            // map pot to PWM drive range
+
+#ifdef DEBUG_DRIVE_SPEED
+          Serial.printf("Drive Speed: Pot R1 = %d, mapped = %d\n", pot, driveSpeed);
+#endif
+/*
+#ifdef DEBUG_ENCODER_COUNTS
+          Serial.printf("Encoders: Left = %ld, Right = %ld\n", pos[0], pos[1]);
+#endif    
+*/
+
+          if (timeUp110sec) {
+            setMotor(1, 255, cIN1Pin[0], cIN2Pin[0]);
+          } else {
+            setMotor(1, 0, cIN1Pin[0], cIN2Pin[0]);
+          }
+
+          
+          //setMotor(1, 255, cIN1Pin[1], cIN2Pin[1]);
+          switch (motionState) {                                       // motion state machine for case 1 behavior
+            case 0:
+              setMotor(1, 255, cIN1Pin[1], cIN2Pin[1]);//drive left motor forward at fixed PWM
+              if (timeUp2secBigWheel) {
+                timeUp2secBigWheel = false;
+                timerCount2secBigWheel = 0;
+                motionState = 1;
+              }
+              //setMotor(1, driveSpeed, cIN1Pin[0], cIN2Pin[0]);
+
+              //setMotor(1, driveSpeed, cIN1Pin[1], cIN2Pin[1]);//drive right motor reverse at fixed PWM (spin/turn behavior)
+              break;
+            case 1:
+              setMotor(-1, 255, cIN1Pin[1], cIN2Pin[1]);
+              if (timerCount2secBigWheel > 500) {                       // once an additional 500ms have passed...
+                timerCount2secBigWheel = 0;                             // reset the timer
+                motionState = 0;
+              }
+              break;            
+          }
+          
+          switch (motionState2) {
+              case 0:
+                setMotor(1, driveSpeed, cIN1Pin[2], cIN2Pin[2]);
+                setMotor(1, driveSpeed, cIN1Pin[3], cIN2Pin[3]);
+                if (timeUp10sec) {
+                  motionState2 += 1;
+                  timerCount10sec = 0;
+                  timeUp10sec = false;
+                  setMotor(2, 0, cIN1Pin[2], cIN2Pin[2]);
+                  setMotor(2, 0, cIN1Pin[3], cIN2Pin[3]);
+                }
+
+                Serial.println(timerCount10sec);
+
+              break;
+
+              case 1:
+              Serial.println("Success");
+                setMotor(-1, driveSpeed, cIN1Pin[2], cIN2Pin[2]);
+                setMotor(-1, driveSpeed, cIN1Pin[3], cIN2Pin[3]);
+                
+                if (timerCount10sec > 15000) {
+                  motionState2 += 1;
+                  timerCount10sec = 0;
+                }
+              break;
+
+              case 2:
+                setMotor(2, 0, cIN1Pin[2], cIN2Pin[2]);
+                setMotor(2, 0, cIN1Pin[3], cIN2Pin[3]);
+              break;
+          }
+          
+        }
+        break;
+
+      case 2: //add your code to do something
+        robotModeIndex = 0;                                            //  !!!!!!!  remove if using the case
+        break;
+
+      case 3: //add your code to do something 
+        robotModeIndex = 0;                                            //  !!!!!!!  remove if using the case
+        break;
+
+      case 4: //add your code to do something 
+        robotModeIndex = 0;                                            //  !!!!!!!  remove if using the case
+        break;
+
+      case 5: //add your code to do something 
+        robotModeIndex = 0;                                            //  !!!!!!!  remove if using the case
+        break;
+
+      case 6: //add your code to do something 
+        robotModeIndex = 0;                                            //  !!!!!!!  remove if using the case
+        break;
+    }
+  }
+
+  doHeartbeat();                                                       // update heartbeat LED
+}
+
+// update heartbeat LED
+void doHeartbeat() {
+  curMillis = millis();                                                // get the current time in milliseconds
+  // check to see if elapsed time matches the heartbeat interval
+  if ((curMillis - lastHeartbeat) > cHeartbeatInterval) {
+    lastHeartbeat = curMillis;                                         // update the heartbeat time for the next update
+    LEDBrightnessIndex++;                                              // shift to the next brightness level
+    if (LEDBrightnessIndex >= sizeof(LEDBrightnessLevels)) {           // if all defined levels have been used
+      LEDBrightnessIndex = 0;                                          // reset to starting brightness
+    }
+    SmartLEDs.setBrightness(LEDBrightnessLevels[LEDBrightnessIndex]);  // set brightness of heartbeat LED
+    SmartLEDs.setPixelColor(0, modeIndicator[robotModeIndex]);         // set pixel colors to = mode 
+    SmartLEDs.show();                                                  // update LED
+  }
+}
+
+
+// send motor control signals, based on direction and pwm (speed)
+void setMotor(int dir, int pwm, int in1, int in2) {
+  if (dir == 1) {                                                      // forward
+    ledcWrite(in1, pwm);
+    ledcWrite(in2, 0);
+  }
+  else if (dir == -1) {                                                // reverse
+    ledcWrite(in1, 0);
+    ledcWrite(in2, pwm);
+  }
+  else {                                                               // stop
+    ledcWrite(in1, 0);
+    ledcWrite(in2, 0);
+  }
+}
+
+// button interrupt service routine
+// argument is pointer to button structure, which is statically cast to a Button structure, 
+// allowing multiple instances of the buttonISR to be created (1 per button)
+void ARDUINO_ISR_ATTR buttonISR(void* arg) {
+  Button* s = static_cast<Button*>(arg);                               // cast pointer to static structure
+
+  uint32_t pressTime = millis();                                       // capture current time
+  if (pressTime > s->nextPressTime) {                                  // if enough time has passed to consider a valid press
+    s->numberPresses += 1;                                             // increment button press counter
+    s->pressed = true;                                                 // indicate valid button press state
+    s->nextPressTime = pressTime + cDebounceDelay;                     // update time for next valid press
+  }  
+}
+
+// encoder interrupt service routine
+// argument is pointer to an encoder structure, which is statically cast to a Encoder structure, allowing multiple
+// instances of the encoderISR to be created (1 per encoder)
+/*
+void ARDUINO_ISR_ATTR encoderISR(void* arg) {
+  Encoder* s = static_cast<Encoder*>(arg);                             // cast pointer to static structure
+  
+  int b = digitalRead(s->PinB);                                        // read state of Channel B
+  if (b > 0) {                                                         // high, leading Channel A
+    s->pos++;                                                          // increase position
+  }
+  else {                                                               // low, lagging Channel A
+    s->pos--;                                                          // decrease position
+  }
+}
+*/
+
